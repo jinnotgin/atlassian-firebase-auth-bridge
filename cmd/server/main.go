@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/YOUR_ORG_OR_USER/atlassian-firebase-auth-bridge/internal/authbridge"
+	"github.com/jinnotgin/atlassian-firebase-auth-bridge/internal/authbridge"
 )
 
 func main() {
