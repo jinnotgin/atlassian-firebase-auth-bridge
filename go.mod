@@ -1,4 +1,4 @@
-module github.com/YOUR_ORG_OR_USER/atlassian-firebase-auth-bridge
+module github.com/jinnotgin/atlassian-firebase-auth-bridge
 
 go 1.22
 
