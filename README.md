@@ -21,3 +21,6 @@ ATLASSIAN_REDIRECT_URI=
 FRONTEND_BASE_URL=
 LOGIN_CODE_SECRET=
 GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
+
+Generate LOGIN_CODE_SECRET with:
+openssl rand -base64 48
