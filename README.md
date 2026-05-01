@@ -1,77 +1,332 @@
 # Atlassian Firebase Auth Bridge
 
-OAuth bridge that lets an app use Atlassian login as the primary login method while still using Firebase Auth and Firestore.
+A small Go service that lets a frontend application use Atlassian OAuth as the sign-in provider while still using Firebase Authentication as the application session system.
 
-The frontend does **not** talk to Atlassian directly and does **not** store Atlassian secrets. The bridge handles the Atlassian OAuth flow, creates or updates the Firebase Auth user, mints a Firebase custom token, and returns that token to the frontend through a short-lived one-time login code.
+## Problem Statement
 
----
+Firebase Auth does not provide a built-in Atlassian sign-in provider. A frontend-only Atlassian OAuth integration would also expose client secrets and make it awkward to mint Firebase custom tokens safely.
 
-## Flow
+This service sits between the frontend application, Atlassian, and Firebase:
 
-1. App redirects to:
+- The frontend application redirects users to the auth bridge service to start Atlassian sign-in.
+- The auth bridge service owns the Atlassian OAuth client secret.
+- The auth bridge service validates the Atlassian user, creates or updates the matching Firebase Auth user, and mints a Firebase custom token.
+- Firestore stores the short-lived one-time login code used to pass the result back to the frontend safely.
+- The frontend application exchanges that login code for the Firebase custom token and calls `signInWithCustomToken()`.
 
-    ```text
-    /auth/atlassian/start
-    ```
+The Firebase custom token is never placed directly in a browser redirect URL.
 
-Optionally with a safe relative redirect path:
+## Terminology
 
-    ```text
-    /auth/atlassian/start?redirect=/overview
-    ```
+This README uses these names consistently:
 
-2. User signs into Atlassian.
+- **Frontend application**: your web UI, for example a Vue, React, or other browser app using the Firebase client SDK.
+- **Auth bridge service**: this Go service.
+- **Atlassian OAuth app**: the OAuth 2.0 integration configured in the Atlassian developer console.
+- **Firebase project**: the Firebase project containing Firebase Auth and Firestore.
+- **Login code**: this service's short-lived one-time code stored in Firestore. It is not the Atlassian authorization code.
 
-3. Atlassian redirects back to:
+## Requirements
+
+You need all of the following before the bridge can complete a login:
+
+- An Atlassian OAuth app with the `read:me` scope.
+- An Atlassian callback URL that points to this service:
+
+  ```text
+  https://your-auth-bridge.example.com/auth/atlassian/callback
+  ```
+
+- A Firebase project with Firebase Authentication enabled.
+- Firestore enabled in the same Firebase project.
+- A Firebase service account JSON file available to the auth bridge service.
+- Permission for the service account to use Firebase Auth and read/write Firestore.
+- A frontend route that handles:
+
+  ```text
+  /auth/callback
+  ```
+
+- Frontend code that exchanges the login code and calls Firebase Auth:
+
+  ```ts
+  signInWithCustomToken(auth, firebaseCustomToken)
+  ```
+
+### Why Firestore is required
+
+After Atlassian redirects back to the auth bridge service, the service mints a Firebase custom token. Instead of putting that token in the browser URL, the service stores it in Firestore under an opaque one-time login code.
+
+The frontend application receives only the login code:
+
+```text
+/auth/callback?login_code=...
+```
+
+It then exchanges the login code with:
+
+```http
+POST /auth/session/exchange
+```
+
+This Firestore-backed handoff makes the login flow work across multiple service instances, Cloud Run restarts, scale-to-zero, and new deployments.
+
+## Architecture
+
+```text
+Frontend application
+  | 1. redirect user to /auth/atlassian/start
+  v
+Auth bridge service
+  | 2. redirect user to Atlassian OAuth
+  v
+Atlassian
+  | 3. callback with authorization code
+  v
+Auth bridge service
+  | 4. exchange Atlassian code
+  | 5. fetch Atlassian profile
+  | 6. create/update Firebase Auth user
+  | 7. mint Firebase custom token
+  | 8. store token in Firestore under login code
+  v
+Frontend application
+  | 9. exchange login code
+  | 10. sign in with Firebase custom token
+  v
+Firebase Auth session
+```
+
+## Login Flow
+
+1. The frontend application redirects the browser to the auth bridge service:
+
+   ```text
+   /auth/atlassian/start
+   ```
+
+   It can include a safe relative redirect path and its own origin:
+
+   ```text
+   /auth/atlassian/start?redirect=/overview&frontend_origin=http://localhost:5173
+   ```
+
+2. The auth bridge service redirects the user to Atlassian.
+
+3. The user signs in with Atlassian.
+
+4. Atlassian redirects back to the auth bridge service:
 
    ```text
    /auth/atlassian/callback
    ```
 
-4. Backend exchanges the Atlassian authorization code for an Atlassian access token.
+5. The auth bridge service exchanges the Atlassian authorization code for an Atlassian access token.
 
-5. Backend calls Atlassian:
+6. The auth bridge service calls:
 
    ```text
    https://api.atlassian.com/me
    ```
 
-6. Backend requires Atlassian to return:
+7. Atlassian must return both:
 
    ```text
    account_id
    email
    ```
 
-7. Backend creates or updates a Firebase Auth user using UID:
+8. The auth bridge service creates or updates a Firebase Auth user with this UID:
 
    ```text
    atlassian:{account_id}
    ```
 
-8. Backend mints a Firebase custom token.
+9. The auth bridge service mints a Firebase custom token.
 
-9. Backend stores the Firebase custom token in Firestore under a short-lived one-time login code.
+10. The auth bridge service stores that custom token in Firestore under a short-lived one-time login code.
 
-10. Backend redirects the frontend to:
+11. The auth bridge service redirects the browser back to the frontend application:
 
     ```text
     /auth/callback?login_code=...&redirect=/overview
     ```
 
-11. App exchanges the `login_code` with the bridge.
+12. The frontend application posts the `login_code` to the auth bridge service.
 
-12. App calls:
+13. The auth bridge service consumes and deletes the login code, then returns the Firebase custom token.
+
+14. The frontend application signs in to Firebase:
 
     ```ts
     signInWithCustomToken(auth, firebaseCustomToken)
     ```
 
-13. App redirects the user to the returned redirect path, or `/overview`.
+15. The frontend application redirects the user to the returned redirect path, or `/overview`.
 
----
+## Configuration
 
-## API contract
+Required environment variables:
+
+```env
+ATLASSIAN_CLIENT_ID=
+ATLASSIAN_CLIENT_SECRET=
+ATLASSIAN_REDIRECT_URI=
+FRONTEND_BASE_URL=
+ALLOWED_FRONTEND_ORIGINS=
+ALLOWED_CORS_ORIGINS=
+LOGIN_CODE_SECRET=
+GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
+```
+
+Example:
+
+```env
+ATLASSIAN_CLIENT_ID=your-atlassian-client-id
+ATLASSIAN_CLIENT_SECRET=your-atlassian-client-secret
+ATLASSIAN_REDIRECT_URI=https://your-auth-bridge.example.com/auth/atlassian/callback
+FRONTEND_BASE_URL=https://your-frontend.example.com
+ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
+ALLOWED_CORS_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
+LOGIN_CODE_SECRET=your-long-random-secret
+GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
+```
+
+### Environment variable reference
+
+| Variable | Purpose |
+| --- | --- |
+| `ATLASSIAN_CLIENT_ID` | Atlassian OAuth client ID. |
+| `ATLASSIAN_CLIENT_SECRET` | Atlassian OAuth client secret. Keep this only on the auth bridge service. |
+| `ATLASSIAN_REDIRECT_URI` | Exact callback URL registered in the Atlassian developer console. |
+| `FRONTEND_BASE_URL` | Default frontend origin used for redirects when no allowed `frontend_origin` is supplied. |
+| `ALLOWED_FRONTEND_ORIGINS` | Comma-separated list of frontend origins the service may redirect users back to after OAuth. |
+| `ALLOWED_CORS_ORIGINS` | Comma-separated list of frontend origins allowed to call `POST /auth/session/exchange`. |
+| `LOGIN_CODE_SECRET` | Secret used to sign OAuth state. Generate a long random value. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to the Firebase service account JSON file. Defaults to `/secrets/firebase-service-account.json` if unset. |
+
+Generate `LOGIN_CODE_SECRET` with:
+
+```bash
+openssl rand -base64 48
+```
+
+### Redirect and CORS origins
+
+`ALLOWED_FRONTEND_ORIGINS` controls where the auth bridge service may redirect the browser after Atlassian completes OAuth.
+
+`ALLOWED_CORS_ORIGINS` controls which browser origins may call:
+
+```http
+POST /auth/session/exchange
+```
+
+For production-only deployments, these are usually the same single frontend origin:
+
+```env
+ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com
+ALLOWED_CORS_ORIGINS=https://your-frontend.example.com
+```
+
+For local development, include your dev server origins:
+
+```env
+ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
+ALLOWED_CORS_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
+```
+
+## Firestore
+
+The auth bridge service writes login handoff records to this collection:
+
+```text
+authLoginCodes
+```
+
+Documents are created automatically. Each document stores:
+
+```json
+{
+  "firebaseCustomToken": "...",
+  "uid": "atlassian:712020:abc123",
+  "email": "user@example.com",
+  "atlassianAccountId": "712020:abc123",
+  "redirect": "/overview",
+  "expiresAt": "...",
+  "createdAt": "..."
+}
+```
+
+The frontend application should never read or write this collection directly.
+
+### Firestore rules
+
+Deny all client access to login codes:
+
+```js
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /authLoginCodes/{loginCode} {
+      allow read, write: if false;
+    }
+
+    // App-specific rules go below.
+    match /users/{userId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+    }
+  }
+}
+```
+
+The auth bridge service uses the Firebase Admin SDK, so it can still access Firestore even when client rules deny access.
+
+### Recommended TTL
+
+Enable Firestore TTL for abandoned login codes:
+
+```text
+Collection group: authLoginCodes
+TTL field: expiresAt
+```
+
+The service deletes login codes after successful exchange. TTL is only for cleanup when users abandon the login flow.
+
+## Firebase Auth Behavior
+
+Firebase users are identified by Atlassian account ID:
+
+```text
+atlassian:{account_id}
+```
+
+Example:
+
+```text
+atlassian:712020:abc123
+```
+
+The auth bridge service creates or updates the Firebase Auth user with:
+
+```text
+email
+displayName
+photoURL
+```
+
+The Firebase custom token includes claims like:
+
+```json
+{
+  "provider": "atlassian",
+  "atlassianAccountId": "712020:abc123",
+  "email": "user@example.com"
+}
+```
+
+## API Contract
 
 ### Start Atlassian login
 
@@ -92,15 +347,21 @@ Example:
 https://AUTH_BRIDGE_BASE_URL/auth/atlassian/start?redirect=/overview&frontend_origin=http://localhost:5173
 ```
 
-The `frontend_origin` must be an origin (scheme + host, no path) listed in `ALLOWED_FRONTEND_ORIGINS`. If missing or not allowlisted, it falls back to `FRONTEND_BASE_URL`.
+`frontend_origin` must be an origin, meaning scheme plus host with no path:
 
-The `redirect` value must be a relative frontend path. Invalid values fall back to:
+```text
+http://localhost:5173
+```
+
+It must be listed in `ALLOWED_FRONTEND_ORIGINS`. If it is missing or not allowlisted, the service falls back to `FRONTEND_BASE_URL`.
+
+`redirect` must be a relative frontend path. Invalid values fall back to:
 
 ```text
 /overview
 ```
 
-Valid examples:
+Valid redirect examples:
 
 ```text
 /overview
@@ -108,7 +369,7 @@ Valid examples:
 /settings
 ```
 
-Invalid examples:
+Invalid redirect examples:
 
 ```text
 https://example.com
@@ -116,19 +377,18 @@ https://example.com
 javascript:alert(1)
 ```
 
----
-
 ### Atlassian callback
 
 ```http
 GET /auth/atlassian/callback
 ```
 
-This is called by Atlassian, not by the frontend directly.
+This endpoint is called by Atlassian, not by the frontend application directly.
 
-The callback URL must exactly match the value configured in the Atlassian developer console and in `ATLASSIAN_REDIRECT_URI`.
+The callback URL must exactly match both:
 
----
+- The callback URL configured in the Atlassian developer console.
+- `ATLASSIAN_REDIRECT_URI`.
 
 ### Exchange login code
 
@@ -164,272 +424,46 @@ Error response:
 }
 ```
 
-The login code is one-time-use and short-lived. After a successful exchange, it is deleted from Firestore.
+The login code is one-time-use and short-lived. After a successful exchange, it is deleted from Firestore inside a transaction.
 
----
+### Health check
 
-## Required environment
-
-```env
-ATLASSIAN_CLIENT_ID=
-ATLASSIAN_CLIENT_SECRET=
-ATLASSIAN_REDIRECT_URI=
-FRONTEND_BASE_URL=
-ALLOWED_FRONTEND_ORIGINS=
-ALLOWED_CORS_ORIGINS=
-LOGIN_CODE_SECRET=
-GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
+```http
+GET /healthz
 ```
 
-Example:
-
-```env
-ATLASSIAN_CLIENT_ID=your-atlassian-client-id
-ATLASSIAN_CLIENT_SECRET=your-atlassian-client-secret
-ATLASSIAN_REDIRECT_URI=https://your-auth-bridge.example.com/auth/atlassian/callback
-FRONTEND_BASE_URL=https://your-frontend.example.com
-ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
-ALLOWED_CORS_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
-LOGIN_CODE_SECRET=your-long-random-secret
-GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
-```
-
-### Environment variable notes
-
-#### `ATLASSIAN_CLIENT_ID`
-
-Atlassian OAuth client ID.
-
-#### `ATLASSIAN_CLIENT_SECRET`
-
-Atlassian OAuth client secret.
-
-Keep this only on the backend. Do not expose it to the frontend.
-
-#### `ATLASSIAN_REDIRECT_URI`
-
-The callback URL registered with Atlassian.
-
-Example:
-
-```text
-https://your-auth-bridge.example.com/auth/atlassian/callback
-```
-
-This must match the callback URL in the Atlassian developer console.
-
-#### `FRONTEND_BASE_URL`
-
-The deployed frontend base URL.
-
-Example:
-
-```text
-https://your-frontend.example.com
-```
-
-The backend redirects users here after Atlassian login. Also used as the default `frontend_origin` when the query parameter is missing or not allowlisted.
-
-#### `ALLOWED_FRONTEND_ORIGINS`
-
-Comma-separated list of frontend origins the backend is allowed to redirect to after OAuth.
-
-The frontend can pass `frontend_origin` as a query parameter to `/auth/atlassian/start`. The value must match one of these origins exactly. If missing or not allowlisted, `FRONTEND_BASE_URL` is used.
-
-Example:
-
-```env
-ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
-```
-
-For production-only deployments:
-
-```env
-ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com
-```
-
-#### `ALLOWED_CORS_ORIGINS`
-
-Comma-separated list of frontend origins allowed to call:
-
-```text
-POST /auth/session/exchange
-```
-
-Example:
-
-```env
-ALLOWED_CORS_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
-```
-
-For production-only deployments:
-
-```env
-ALLOWED_CORS_ORIGINS=https://your-frontend.example.com
-```
-
-#### `LOGIN_CODE_SECRET`
-
-Secret used to sign OAuth state.
-
-Generate it with:
-
-```bash
-openssl rand -base64 48
-```
-
-#### `GOOGLE_APPLICATION_CREDENTIALS`
-
-Path to the Firebase service account JSON file.
-
-Example:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
-```
-
----
-
-## Firestore
-
-This bridge uses Firestore to store short-lived one-time login codes.
-
-Collection:
-
-```text
-authLoginCodes
-```
-
-Documents are created automatically by the backend.
-
-Each document stores:
+Response:
 
 ```json
 {
-  "firebaseCustomToken": "...",
-  "uid": "atlassian:...",
-  "email": "user@example.com",
-  "atlassianAccountId": "...",
-  "redirect": "/overview",
-  "expiresAt": "...",
-  "createdAt": "..."
+  "ok": "true"
 }
 ```
 
-The frontend should never read or write this collection directly.
+## Frontend Integration
 
----
-
-## Firestore rules
-
-Deny all client access to login codes:
-
-```js
-rules_version = '2';
-
-service cloud.firestore {
-  match /databases/{database}/documents {
-    match /authLoginCodes/{loginCode} {
-      allow read, write: if false;
-    }
-
-    // App-specific rules go below.
-    match /users/{userId} {
-      allow read, write: if request.auth != null
-        && request.auth.uid == userId;
-    }
-  }
-}
-```
-
-The backend uses the Firebase Admin SDK, so it can still access Firestore even when client rules deny access.
-
----
-
-## Recommended Firestore TTL
-
-Enable Firestore TTL for abandoned login codes.
-
-Collection group:
+The frontend application needs one piece of configuration: the public base URL of the auth bridge service.
 
 ```text
-authLoginCodes
+https://your-auth-bridge.example.com
 ```
 
-TTL field:
-
-```text
-expiresAt
-```
-
-The backend already deletes login codes after successful exchange. TTL is only for cleanup when users abandon the login flow.
-
----
-
-## Firebase Auth behavior
-
-Firebase users are identified by UID:
-
-```text
-atlassian:{account_id}
-```
-
-Example:
-
-```text
-atlassian:712020:abc123
-```
-
-The backend should create or update the Firebase Auth user with:
-
-```text
-email
-displayName
-photoURL
-```
-
-The custom token includes claims such as:
-
-```json
-{
-  "provider": "atlassian",
-  "atlassianAccountId": "712020:abc123",
-  "email": "user@example.com"
-}
-```
-
----
-
-## Frontend integration
-
-### Required frontend environment
-
-```env
-VITE_AUTH_BACKEND_BASE_URL=https://your-auth-bridge.example.com
-```
+How you provide that value depends on your frontend. For example, a Vite application might use `VITE_AUTH_BRIDGE_BASE_URL`, while another frontend might use a different environment variable, runtime config object, or server-rendered setting.
 
 ### Login button
 
+Build a URL to `/auth/atlassian/start` and send the browser there. The `redirect` value is optional; use any relative path that makes sense for your frontend after login.
+
 ```ts
+const authBridgeBaseUrl = import.meta.env.VITE_AUTH_BRIDGE_BASE_URL;
+
 function loginWithAtlassian() {
-  const redirect = encodeURIComponent(
-    router.currentRoute.value.fullPath || "/overview"
-  );
+  const redirect = encodeURIComponent("/overview");
   const frontendOrigin = encodeURIComponent(window.location.origin);
 
   window.location.href =
-    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/atlassian/start?redirect=${redirect}&frontend_origin=${frontendOrigin}`;
-}
-```
-
-If deep-link preservation is not needed:
-
-```ts
-function loginWithAtlassian() {
-  const frontendOrigin = encodeURIComponent(window.location.origin);
-
-  window.location.href =
-    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/atlassian/start?redirect=/overview&frontend_origin=${frontendOrigin}`;
+    `${authBridgeBaseUrl}/auth/atlassian/start` +
+    `?redirect=${redirect}&frontend_origin=${frontendOrigin}`;
 }
 ```
 
@@ -444,8 +478,6 @@ Add a frontend route such as:
 }
 ```
 
-### Callback page behavior
-
 The callback page should:
 
 1. Read `login_code` from the query string.
@@ -453,12 +485,14 @@ The callback page should:
 3. Receive `firebaseCustomToken`.
 4. Call `signInWithCustomToken()`.
 5. Redirect the user to the returned redirect path.
-6. Use `router.replace()`, not `router.push()`, so the callback URL is removed from browser history.
+6. Use `router.replace()`, so the callback URL is removed from browser history.
 
 Example:
 
 ```ts
 import { signInWithCustomToken } from "firebase/auth";
+
+const authBridgeBaseUrl = import.meta.env.VITE_AUTH_BRIDGE_BASE_URL;
 
 function safeRedirectPath(value: unknown): string {
   if (typeof value !== "string") return "/overview";
@@ -476,7 +510,7 @@ async function completeAtlassianLogin(route, router, auth) {
   }
 
   const res = await fetch(
-    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/session/exchange`,
+    `${authBridgeBaseUrl}/auth/session/exchange`,
     {
       method: "POST",
       headers: {
@@ -501,9 +535,7 @@ async function completeAtlassianLogin(route, router, auth) {
 }
 ```
 
----
-
-## Local run
+## Local Development
 
 Create a local `.env` file:
 
@@ -513,6 +545,7 @@ ATLASSIAN_CLIENT_ID=your-atlassian-client-id
 ATLASSIAN_CLIENT_SECRET=your-atlassian-client-secret
 ATLASSIAN_REDIRECT_URI=http://localhost:8080/auth/atlassian/callback
 FRONTEND_BASE_URL=http://localhost:5173
+ALLOWED_FRONTEND_ORIGINS=http://localhost:5173,http://localhost:3000
 ALLOWED_CORS_ORIGINS=http://localhost:5173,http://localhost:3000
 LOGIN_CODE_SECRET=your-long-random-secret
 GOOGLE_APPLICATION_CREDENTIALS=/path/to/firebase-service-account.json
@@ -523,8 +556,6 @@ Run:
 ```bash
 go run ./cmd/server
 ```
-
----
 
 ## Docker
 
@@ -542,17 +573,16 @@ docker run --rm -p 8080:8080 --env-file .env \
   atlassian-firebase-auth-bridge
 ```
 
----
+## Cloud Run Deployment Notes
 
-## Cloud Run deployment notes
-
-The service should be deployed with:
+Configure the service with:
 
 ```text
 ATLASSIAN_CLIENT_ID
 ATLASSIAN_CLIENT_SECRET
 ATLASSIAN_REDIRECT_URI
 FRONTEND_BASE_URL
+ALLOWED_FRONTEND_ORIGINS
 ALLOWED_CORS_ORIGINS
 LOGIN_CODE_SECRET
 GOOGLE_APPLICATION_CREDENTIALS
@@ -567,7 +597,7 @@ roles/secretmanager.secretAccessor
 
 `roles/secretmanager.secretAccessor` is only needed if secrets are mounted from Secret Manager.
 
-Firestore means the service no longer needs to rely on process memory for login codes. This makes the bridge safe across:
+Because login codes are stored in Firestore, the service does not rely on process memory for login handoff state. This makes the bridge suitable for:
 
 ```text
 Cloud Run restarts
@@ -577,33 +607,14 @@ new deployments
 revision rollouts
 ```
 
----
+## Security Notes
 
-## Security notes
-
-* Do not put Atlassian secrets in the frontend.
-* Do not put Firebase service account credentials in the frontend.
-* `login_code` is opaque and one-time-use.
-* `login_code` expires quickly.
-* The Firebase custom token is not placed directly in the browser URL.
-* The frontend should remove the callback URL from browser history using `router.replace()`.
-* Only allow known frontend origins in `ALLOWED_CORS_ORIGINS`.
-* Only allow relative redirect paths.
-* Deny direct client access to `authLoginCodes` in Firestore rules.
-
----
-
-## Health check
-
-```http
-GET /healthz
-```
-
-Response:
-
-```json
-{
-  "ok": "true"
-}
-```
-
+- Do not put Atlassian secrets in the frontend application.
+- Do not put Firebase service account credentials in the frontend application.
+- Keep `ATLASSIAN_CLIENT_SECRET`, `LOGIN_CODE_SECRET`, and service account credentials in your server-side secret store.
+- `login_code` values are opaque, short-lived, and one-time-use.
+- The Firebase custom token is not placed directly in the browser URL.
+- The frontend application should remove the callback URL from browser history with `router.replace()`.
+- Only allow known frontend origins in `ALLOWED_FRONTEND_ORIGINS` and `ALLOWED_CORS_ORIGINS`.
+- Only allow relative redirect paths.
+- Deny direct client access to `authLoginCodes` in Firestore rules.
