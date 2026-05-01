@@ -1,1 +1,23 @@
-# atlassian-firebase-auth-bridge
+# Atlassian Firebase Auth Bridge
+
+OAuth bridge that lets a Vue app use Atlassian login as the primary login method while still using Firebase Auth and Firestore.
+
+## Flow
+
+1. Vue redirects to `/auth/atlassian/start`
+2. User signs into Atlassian
+3. Atlassian redirects to `/auth/atlassian/callback`
+4. Backend calls Atlassian `/me`
+5. Backend requires an email address
+6. Backend mints Firebase custom token using UID `atlassian:{account_id}`
+7. Vue calls `signInWithCustomToken()`
+
+## Required environment
+
+```env
+ATLASSIAN_CLIENT_ID=
+ATLASSIAN_CLIENT_SECRET=
+ATLASSIAN_REDIRECT_URI=
+FRONTEND_BASE_URL=
+LOGIN_CODE_SECRET=
+GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
