@@ -9,26 +9,41 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/auth"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-var firebaseAuth *auth.Client
+var (
+	clientsMu       sync.Mutex
+	firebaseAuth    *auth.Client
+	firestoreClient *firestore.Client
+)
+
+const (
+	loginCodeTTL        = 2 * time.Minute
+	oauthStateTTL       = 10 * time.Minute
+	loginCodesCollName = "authLoginCodes"
+)
 
 type Config struct {
 	AtlassianClientID     string
 	AtlassianClientSecret string
 	AtlassianRedirectURI  string
 	FrontendBaseURL       string
+	AllowedCORSOrigins    []string
 	LoginCodeSecret       string
 	ServiceAccountPath    string
 }
@@ -49,13 +64,20 @@ type AtlassianMe struct {
 	AccountType string `json:"account_type"`
 }
 
-type LoginCodePayload struct {
-	FirebaseCustomToken string `json:"firebaseCustomToken"`
-	UID                 string `json:"uid"`
-	Email               string `json:"email"`
-	AtlassianAccountID  string `json:"atlassianAccountId"`
-	Exp                 int64  `json:"exp"`
-	Nonce               string `json:"nonce"`
+type OAuthStatePayload struct {
+	Nonce    string `json:"nonce"`
+	Exp      int64  `json:"exp"`
+	Redirect string `json:"redirect"`
+}
+
+type LoginCodeRecord struct {
+	FirebaseCustomToken string    `firestore:"firebaseCustomToken"`
+	UID                 string    `firestore:"uid"`
+	Email               string    `firestore:"email"`
+	AtlassianAccountID  string    `firestore:"atlassianAccountId"`
+	Redirect            string    `firestore:"redirect"`
+	ExpiresAt           time.Time `firestore:"expiresAt"`
+	CreatedAt           time.Time `firestore:"createdAt"`
 }
 
 type ExchangeRequest struct {
@@ -66,24 +88,24 @@ type ExchangeResponse struct {
 	FirebaseCustomToken string `json:"firebaseCustomToken"`
 	UID                 string `json:"uid"`
 	Email               string `json:"email"`
+	Redirect            string `json:"redirect,omitempty"`
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
 	cfg, err := loadConfig()
 	if err != nil {
+		log.Printf("config error: %v", err)
 		http.Error(w, "server configuration error", http.StatusInternalServerError)
 		return
 	}
 
 	ctx := r.Context()
 
-	if firebaseAuth == nil {
-		client, err := initFirebaseAuth(ctx, cfg.ServiceAccountPath)
-		if err != nil {
-			http.Error(w, "firebase initialization error", http.StatusInternalServerError)
-			return
-		}
-		firebaseAuth = client
+	authClient, fsClient, err := ensureClients(ctx, cfg)
+	if err != nil {
+		log.Printf("client initialization error: %v", err)
+		http.Error(w, "server initialization error", http.StatusInternalServerError)
+		return
 	}
 
 	switch {
@@ -94,10 +116,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		handleStart(w, r, cfg)
 
 	case r.Method == http.MethodGet && r.URL.Path == "/auth/atlassian/callback":
-		handleCallback(w, r, cfg, firebaseAuth)
+		handleCallback(w, r, cfg, authClient, fsClient)
 
-	case r.Method == http.MethodPost && r.URL.Path == "/auth/session/exchange":
-		handleExchange(w, r, cfg)
+	case (r.Method == http.MethodPost || r.Method == http.MethodOptions) &&
+		r.URL.Path == "/auth/session/exchange":
+		handleExchange(w, r, cfg, fsClient)
 
 	default:
 		http.NotFound(w, r)
@@ -105,11 +128,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func loadConfig() (Config, error) {
+	frontendBaseURL := strings.TrimRight(os.Getenv("FRONTEND_BASE_URL"), "/")
+
 	cfg := Config{
 		AtlassianClientID:     os.Getenv("ATLASSIAN_CLIENT_ID"),
 		AtlassianClientSecret: os.Getenv("ATLASSIAN_CLIENT_SECRET"),
 		AtlassianRedirectURI:  os.Getenv("ATLASSIAN_REDIRECT_URI"),
-		FrontendBaseURL:       strings.TrimRight(os.Getenv("FRONTEND_BASE_URL"), "/"),
+		FrontendBaseURL:       frontendBaseURL,
+		AllowedCORSOrigins:    parseAllowedOrigins(frontendBaseURL, os.Getenv("ALLOWED_CORS_ORIGINS")),
 		LoginCodeSecret:       os.Getenv("LOGIN_CODE_SECRET"),
 		ServiceAccountPath:    os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
 	}
@@ -130,19 +156,64 @@ func loadConfig() (Config, error) {
 	return cfg, nil
 }
 
-func initFirebaseAuth(ctx context.Context, serviceAccountPath string) (*auth.Client, error) {
-	app, err := firebase.NewApp(ctx, nil, option.WithCredentialsFile(serviceAccountPath))
-	if err != nil {
-		return nil, err
+func parseAllowedOrigins(frontendBaseURL string, raw string) []string {
+	seen := map[string]bool{}
+	var origins []string
+
+	add := func(origin string) {
+		origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+		if origin == "" || seen[origin] {
+			return
+		}
+		seen[origin] = true
+		origins = append(origins, origin)
 	}
 
-	return app.Auth(ctx)
+	add(frontendBaseURL)
+
+	for _, part := range strings.Split(raw, ",") {
+		add(part)
+	}
+
+	return origins
+}
+
+func ensureClients(ctx context.Context, cfg Config) (*auth.Client, *firestore.Client, error) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	if firebaseAuth != nil && firestoreClient != nil {
+		return firebaseAuth, firestoreClient, nil
+	}
+
+	app, err := firebase.NewApp(ctx, nil, option.WithCredentialsFile(cfg.ServiceAccountPath))
+	if err != nil {
+		return nil, nil, fmt.Errorf("firebase app: %w", err)
+	}
+
+	authClient, err := app.Auth(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("firebase auth: %w", err)
+	}
+
+	fsClient, err := app.Firestore(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("firestore: %w", err)
+	}
+
+	firebaseAuth = authClient
+	firestoreClient = fsClient
+
+	return firebaseAuth, firestoreClient, nil
 }
 
 func handleStart(w http.ResponseWriter, r *http.Request, cfg Config) {
-	statePayload := map[string]any{
-		"nonce": randomString(32),
-		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+	redirectPath := safeRedirectPath(r.URL.Query().Get("redirect"))
+
+	statePayload := OAuthStatePayload{
+		Nonce:    randomString(32),
+		Exp:      time.Now().Add(oauthStateTTL).Unix(),
+		Redirect: redirectPath,
 	}
 
 	stateBytes, _ := json.Marshal(statePayload)
@@ -162,7 +233,13 @@ func handleStart(w http.ResponseWriter, r *http.Request, cfg Config) {
 	http.Redirect(w, r, authURL.String(), http.StatusFound)
 }
 
-func handleCallback(w http.ResponseWriter, r *http.Request, cfg Config, authClient *auth.Client) {
+func handleCallback(
+	w http.ResponseWriter,
+	r *http.Request,
+	cfg Config,
+	authClient *auth.Client,
+	fsClient *firestore.Client,
+) {
 	ctx := r.Context()
 
 	code := r.URL.Query().Get("code")
@@ -179,19 +256,25 @@ func handleCallback(w http.ResponseWriter, r *http.Request, cfg Config, authClie
 		return
 	}
 
-	if err := verifyState(state, cfg.LoginCodeSecret); err != nil {
+	statePayload, err := verifyState(state, cfg.LoginCodeSecret)
+	if err != nil {
+		log.Printf("invalid oauth state: %v", err)
 		redirectError(w, r, cfg, "invalid_state", "Invalid or expired login state.")
 		return
 	}
 
+	redirectPath := safeRedirectPath(statePayload.Redirect)
+
 	tokenResp, err := exchangeCodeForToken(ctx, cfg, code)
 	if err != nil {
+		log.Printf("atlassian token exchange failed: %v", err)
 		redirectError(w, r, cfg, "token_exchange_failed", "Could not complete Atlassian sign-in.")
 		return
 	}
 
 	me, err := fetchAtlassianMe(ctx, tokenResp.AccessToken)
 	if err != nil {
+		log.Printf("atlassian profile failed: %v", err)
 		redirectError(w, r, cfg, "profile_failed", "Could not read your Atlassian profile.")
 		return
 	}
@@ -214,6 +297,12 @@ func handleCallback(w http.ResponseWriter, r *http.Request, cfg Config, authClie
 
 	uid := "atlassian:" + me.AccountID
 
+	if err := upsertFirebaseUser(ctx, authClient, uid, me); err != nil {
+		log.Printf("firebase user upsert failed: %v", err)
+		redirectError(w, r, cfg, "firebase_user_failed", "Could not prepare your Firebase account.")
+		return
+	}
+
 	claims := map[string]interface{}{
 		"provider":           "atlassian",
 		"atlassianAccountId": me.AccountID,
@@ -222,24 +311,81 @@ func handleCallback(w http.ResponseWriter, r *http.Request, cfg Config, authClie
 
 	customToken, err := authClient.CustomTokenWithClaims(ctx, uid, claims)
 	if err != nil {
+		log.Printf("firebase custom token failed: %v", err)
 		redirectError(w, r, cfg, "firebase_token_failed", "Could not create Firebase login token.")
 		return
 	}
 
-	loginPayload := LoginCodePayload{
+	loginCode := randomString(32)
+	now := time.Now()
+
+	record := LoginCodeRecord{
 		FirebaseCustomToken: customToken,
 		UID:                 uid,
 		Email:               me.Email,
 		AtlassianAccountID:  me.AccountID,
-		Exp:                 time.Now().Add(2 * time.Minute).Unix(),
-		Nonce:               randomString(32),
+		Redirect:            redirectPath,
+		ExpiresAt:           now.Add(loginCodeTTL),
+		CreatedAt:           now,
 	}
 
-	payloadBytes, _ := json.Marshal(loginPayload)
-	loginCode := signBlob(payloadBytes, cfg.LoginCodeSecret)
+	if err := storeLoginCode(ctx, fsClient, loginCode, record); err != nil {
+		log.Printf("store login code failed: %v", err)
+		redirectError(w, r, cfg, "login_code_failed", "Could not create login session.")
+		return
+	}
 
-	callbackURL := cfg.FrontendBaseURL + "/auth/callback?login_code=" + url.QueryEscape(loginCode)
+	callbackURL := cfg.FrontendBaseURL +
+		"/auth/callback?login_code=" + url.QueryEscape(loginCode) +
+		"&redirect=" + url.QueryEscape(redirectPath)
+
 	http.Redirect(w, r, callbackURL, http.StatusFound)
+}
+
+func upsertFirebaseUser(ctx context.Context, authClient *auth.Client, uid string, me AtlassianMe) error {
+	update := (&auth.UserToUpdate{}).
+		Email(me.Email)
+
+	if strings.TrimSpace(me.Name) != "" {
+		update = update.DisplayName(me.Name)
+	}
+
+	if strings.TrimSpace(me.Picture) != "" {
+		update = update.PhotoURL(me.Picture)
+	}
+
+	_, err := authClient.UpdateUser(ctx, uid, update)
+	if err == nil {
+		return nil
+	}
+
+	if !auth.IsUserNotFound(err) {
+		return err
+	}
+
+	create := (&auth.UserToCreate{}).
+		UID(uid).
+		Email(me.Email)
+
+	if strings.TrimSpace(me.Name) != "" {
+		create = create.DisplayName(me.Name)
+	}
+
+	if strings.TrimSpace(me.Picture) != "" {
+		create = create.PhotoURL(me.Picture)
+	}
+
+	_, err = authClient.CreateUser(ctx, create)
+	return err
+}
+
+func storeLoginCode(ctx context.Context, fsClient *firestore.Client, loginCode string, record LoginCodeRecord) error {
+	_, err := fsClient.
+		Collection(loginCodesCollName).
+		Doc(loginCode).
+		Set(ctx, record)
+
+	return err
 }
 
 func exchangeCodeForToken(ctx context.Context, cfg Config, code string) (AtlassianTokenResponse, error) {
@@ -324,73 +470,121 @@ func fetchAtlassianMe(ctx context.Context, accessToken string) (AtlassianMe, err
 	return me, nil
 }
 
-func handleExchange(w http.ResponseWriter, r *http.Request, cfg Config) {
-	addCORS(w, cfg)
+func handleExchange(w http.ResponseWriter, r *http.Request, cfg Config, fsClient *firestore.Client) {
+	addCORS(w, r, cfg)
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{
+			"error": "method_not_allowed",
+		})
+		return
+	}
+
 	var req ExchangeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_json",
+		})
 		return
 	}
 
-	payloadBytes, err := verifySignedBlob(req.LoginCode, cfg.LoginCodeSecret)
+	loginCode := strings.TrimSpace(req.LoginCode)
+	if loginCode == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "missing_login_code",
+		})
+		return
+	}
+
+	record, err := consumeLoginCode(r.Context(), fsClient, loginCode)
 	if err != nil {
-		http.Error(w, "invalid or expired login code", http.StatusUnauthorized)
-		return
-	}
-
-	var payload LoginCodePayload
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		http.Error(w, "invalid login payload", http.StatusUnauthorized)
-		return
-	}
-
-	if time.Now().Unix() > payload.Exp {
-		http.Error(w, "expired login code", http.StatusUnauthorized)
-		return
-	}
-
-	if payload.FirebaseCustomToken == "" || payload.UID == "" || payload.Email == "" {
-		http.Error(w, "invalid login payload", http.StatusUnauthorized)
+		log.Printf("consume login code failed: %v", err)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "invalid_or_expired_login_code",
+		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, ExchangeResponse{
-		FirebaseCustomToken: payload.FirebaseCustomToken,
-		UID:                 payload.UID,
-		Email:               payload.Email,
+		FirebaseCustomToken: record.FirebaseCustomToken,
+		UID:                 record.UID,
+		Email:               record.Email,
+		Redirect:            record.Redirect,
 	})
 }
 
-func verifyState(state string, secret string) error {
+func consumeLoginCode(ctx context.Context, fsClient *firestore.Client, loginCode string) (LoginCodeRecord, error) {
+	docRef := fsClient.Collection(loginCodesCollName).Doc(loginCode)
+
+	var record LoginCodeRecord
+
+	err := fsClient.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(docRef)
+		if err != nil {
+			return err
+		}
+
+		if err := snap.DataTo(&record); err != nil {
+			return err
+		}
+
+		if record.FirebaseCustomToken == "" || record.UID == "" || record.Email == "" {
+			return errors.New("invalid login code record")
+		}
+
+		if time.Now().After(record.ExpiresAt) {
+			// Delete expired code as cleanup.
+			if err := tx.Delete(docRef); err != nil {
+				return err
+			}
+			return errors.New("expired login code")
+		}
+
+		// Critical: delete inside the transaction so this code is one-time-use.
+		if err := tx.Delete(docRef); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return LoginCodeRecord{}, errors.New("login code not found")
+		}
+		return LoginCodeRecord{}, err
+	}
+
+	return record, nil
+}
+
+func verifyState(state string, secret string) (OAuthStatePayload, error) {
 	payloadBytes, err := verifySignedBlob(state, secret)
 	if err != nil {
-		return err
+		return OAuthStatePayload{}, err
 	}
 
-	var payload struct {
-		Nonce string `json:"nonce"`
-		Exp   int64  `json:"exp"`
-	}
-
+	var payload OAuthStatePayload
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return err
+		return OAuthStatePayload{}, err
 	}
 
 	if payload.Nonce == "" {
-		return errors.New("missing nonce")
+		return OAuthStatePayload{}, errors.New("missing nonce")
 	}
 
 	if time.Now().Unix() > payload.Exp {
-		return errors.New("state expired")
+		return OAuthStatePayload{}, errors.New("state expired")
 	}
 
-	return nil
+	payload.Redirect = safeRedirectPath(payload.Redirect)
+
+	return payload, nil
 }
 
 func signBlob(payload []byte, secret string) string {
@@ -436,8 +630,37 @@ func verifySignedBlob(token string, secret string) ([]byte, error) {
 }
 
 func redirectError(w http.ResponseWriter, r *http.Request, cfg Config, code string, message string) {
-	u := cfg.FrontendBaseURL + "/login?error=" + url.QueryEscape(code) + "&message=" + url.QueryEscape(message)
+	u := cfg.FrontendBaseURL +
+		"/login?error=" + url.QueryEscape(code) +
+		"&message=" + url.QueryEscape(message)
+
 	http.Redirect(w, r, u, http.StatusFound)
+}
+
+func safeRedirectPath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "/overview"
+	}
+
+	if !strings.HasPrefix(raw, "/") {
+		return "/overview"
+	}
+
+	if strings.HasPrefix(raw, "//") {
+		return "/overview"
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "/overview"
+	}
+
+	if u.IsAbs() || u.Host != "" {
+		return "/overview"
+	}
+
+	return raw
 }
 
 func randomString(nBytes int) string {
@@ -452,13 +675,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func addCORS(w http.ResponseWriter, cfg Config) {
-	w.Header().Set("Access-Control-Allow-Origin", cfg.FrontendBaseURL)
+func addCORS(w http.ResponseWriter, r *http.Request, cfg Config) {
+	origin := strings.TrimRight(r.Header.Get("Origin"), "/")
+
+	for _, allowed := range cfg.AllowedCORSOrigins {
+		if origin == allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			break
+		}
+	}
+
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Vary", "Origin")
-}
-
-func escape(s string) string {
-	return html.EscapeString(s)
 }
