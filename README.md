@@ -79,17 +79,20 @@ Optionally with a safe relative redirect path:
 GET /auth/atlassian/start
 ```
 
-Optional query parameter:
+Optional query parameters:
 
 ```text
 redirect=/some/frontend/path
+frontend_origin=http://localhost:5173
 ```
 
 Example:
 
 ```text
-https://AUTH_BRIDGE_BASE_URL/auth/atlassian/start?redirect=/overview
+https://AUTH_BRIDGE_BASE_URL/auth/atlassian/start?redirect=/overview&frontend_origin=http://localhost:5173
 ```
+
+The `frontend_origin` must be an origin (scheme + host, no path) listed in `ALLOWED_FRONTEND_ORIGINS`. If missing or not allowlisted, it falls back to `FRONTEND_BASE_URL`.
 
 The `redirect` value must be a relative frontend path. Invalid values fall back to:
 
@@ -172,6 +175,7 @@ ATLASSIAN_CLIENT_ID=
 ATLASSIAN_CLIENT_SECRET=
 ATLASSIAN_REDIRECT_URI=
 FRONTEND_BASE_URL=
+ALLOWED_FRONTEND_ORIGINS=
 ALLOWED_CORS_ORIGINS=
 LOGIN_CODE_SECRET=
 GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
@@ -184,6 +188,7 @@ ATLASSIAN_CLIENT_ID=your-atlassian-client-id
 ATLASSIAN_CLIENT_SECRET=your-atlassian-client-secret
 ATLASSIAN_REDIRECT_URI=https://your-auth-bridge.example.com/auth/atlassian/callback
 FRONTEND_BASE_URL=https://your-frontend.example.com
+ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
 ALLOWED_CORS_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
 LOGIN_CODE_SECRET=your-long-random-secret
 GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-service-account.json
@@ -223,7 +228,25 @@ Example:
 https://your-frontend.example.com
 ```
 
-The backend redirects users here after Atlassian login.
+The backend redirects users here after Atlassian login. Also used as the default `frontend_origin` when the query parameter is missing or not allowlisted.
+
+#### `ALLOWED_FRONTEND_ORIGINS`
+
+Comma-separated list of frontend origins the backend is allowed to redirect to after OAuth.
+
+The frontend can pass `frontend_origin` as a query parameter to `/auth/atlassian/start`. The value must match one of these origins exactly. If missing or not allowlisted, `FRONTEND_BASE_URL` is used.
+
+Example:
+
+```env
+ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com,http://localhost:5173,http://localhost:3000
+```
+
+For production-only deployments:
+
+```env
+ALLOWED_FRONTEND_ORIGINS=https://your-frontend.example.com
+```
 
 #### `ALLOWED_CORS_ORIGINS`
 
@@ -392,9 +415,10 @@ function loginWithAtlassian() {
   const redirect = encodeURIComponent(
     router.currentRoute.value.fullPath || "/overview"
   );
+  const frontendOrigin = encodeURIComponent(window.location.origin);
 
   window.location.href =
-    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/atlassian/start?redirect=${redirect}`;
+    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/atlassian/start?redirect=${redirect}&frontend_origin=${frontendOrigin}`;
 }
 ```
 
@@ -402,8 +426,10 @@ If deep-link preservation is not needed:
 
 ```ts
 function loginWithAtlassian() {
+  const frontendOrigin = encodeURIComponent(window.location.origin);
+
   window.location.href =
-    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/atlassian/start?redirect=/overview`;
+    `${import.meta.env.VITE_AUTH_BACKEND_BASE_URL}/auth/atlassian/start?redirect=/overview&frontend_origin=${frontendOrigin}`;
 }
 ```
 

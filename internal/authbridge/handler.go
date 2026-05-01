@@ -43,6 +43,7 @@ type Config struct {
 	AtlassianClientSecret string
 	AtlassianRedirectURI  string
 	FrontendBaseURL       string
+	AllowedFrontendOrigins []string
 	AllowedCORSOrigins    []string
 	LoginCodeSecret       string
 	ServiceAccountPath    string
@@ -65,9 +66,10 @@ type AtlassianMe struct {
 }
 
 type OAuthStatePayload struct {
-	Nonce    string `json:"nonce"`
-	Exp      int64  `json:"exp"`
-	Redirect string `json:"redirect"`
+	Nonce          string `json:"nonce"`
+	Exp            int64  `json:"exp"`
+	Redirect       string `json:"redirect"`
+	FrontendOrigin string `json:"frontendOrigin"`
 }
 
 type LoginCodeRecord struct {
@@ -131,13 +133,14 @@ func loadConfig() (Config, error) {
 	frontendBaseURL := strings.TrimRight(os.Getenv("FRONTEND_BASE_URL"), "/")
 
 	cfg := Config{
-		AtlassianClientID:     os.Getenv("ATLASSIAN_CLIENT_ID"),
-		AtlassianClientSecret: os.Getenv("ATLASSIAN_CLIENT_SECRET"),
-		AtlassianRedirectURI:  os.Getenv("ATLASSIAN_REDIRECT_URI"),
-		FrontendBaseURL:       frontendBaseURL,
-		AllowedCORSOrigins:    parseAllowedOrigins(frontendBaseURL, os.Getenv("ALLOWED_CORS_ORIGINS")),
-		LoginCodeSecret:       os.Getenv("LOGIN_CODE_SECRET"),
-		ServiceAccountPath:    os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+		AtlassianClientID:      os.Getenv("ATLASSIAN_CLIENT_ID"),
+		AtlassianClientSecret:  os.Getenv("ATLASSIAN_CLIENT_SECRET"),
+		AtlassianRedirectURI:   os.Getenv("ATLASSIAN_REDIRECT_URI"),
+		FrontendBaseURL:        frontendBaseURL,
+		AllowedFrontendOrigins: parseAllowedOrigins(frontendBaseURL, os.Getenv("ALLOWED_FRONTEND_ORIGINS")),
+		AllowedCORSOrigins:     parseAllowedOrigins(frontendBaseURL, os.Getenv("ALLOWED_CORS_ORIGINS")),
+		LoginCodeSecret:        os.Getenv("LOGIN_CODE_SECRET"),
+		ServiceAccountPath:     os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
 	}
 
 	if cfg.ServiceAccountPath == "" {
@@ -209,11 +212,17 @@ func ensureClients(ctx context.Context, cfg Config) (*auth.Client, *firestore.Cl
 
 func handleStart(w http.ResponseWriter, r *http.Request, cfg Config) {
 	redirectPath := safeRedirectPath(r.URL.Query().Get("redirect"))
+	frontendOrigin := safeFrontendOrigin(
+		r.URL.Query().Get("frontend_origin"),
+		cfg.AllowedFrontendOrigins,
+		cfg.FrontendBaseURL,
+	)
 
 	statePayload := OAuthStatePayload{
-		Nonce:    randomString(32),
-		Exp:      time.Now().Add(oauthStateTTL).Unix(),
-		Redirect: redirectPath,
+		Nonce:          randomString(32),
+		Exp:            time.Now().Add(oauthStateTTL).Unix(),
+		Redirect:       redirectPath,
+		FrontendOrigin: frontendOrigin,
 	}
 
 	stateBytes, _ := json.Marshal(statePayload)
@@ -256,7 +265,7 @@ func handleCallback(
 		return
 	}
 
-	statePayload, err := verifyState(state, cfg.LoginCodeSecret)
+	statePayload, err := verifyState(state, cfg.LoginCodeSecret, cfg.AllowedFrontendOrigins, cfg.FrontendBaseURL)
 	if err != nil {
 		log.Printf("invalid oauth state: %v", err)
 		redirectError(w, r, cfg, "invalid_state", "Invalid or expired login state.")
@@ -264,31 +273,32 @@ func handleCallback(
 	}
 
 	redirectPath := safeRedirectPath(statePayload.Redirect)
+	frontendOrigin := statePayload.FrontendOrigin
 
 	tokenResp, err := exchangeCodeForToken(ctx, cfg, code)
 	if err != nil {
 		log.Printf("atlassian token exchange failed: %v", err)
-		redirectError(w, r, cfg, "token_exchange_failed", "Could not complete Atlassian sign-in.")
+		redirectErrorToOrigin(w, r, frontendOrigin, "token_exchange_failed", "Could not complete Atlassian sign-in.")
 		return
 	}
 
 	me, err := fetchAtlassianMe(ctx, tokenResp.AccessToken)
 	if err != nil {
 		log.Printf("atlassian profile failed: %v", err)
-		redirectError(w, r, cfg, "profile_failed", "Could not read your Atlassian profile.")
+		redirectErrorToOrigin(w, r, frontendOrigin, "profile_failed", "Could not read your Atlassian profile.")
 		return
 	}
 
 	if strings.TrimSpace(me.AccountID) == "" {
-		redirectError(w, r, cfg, "missing_account_id", "Atlassian did not return an account ID.")
+		redirectErrorToOrigin(w, r, frontendOrigin, "missing_account_id", "Atlassian did not return an account ID.")
 		return
 	}
 
 	if strings.TrimSpace(me.Email) == "" {
-		redirectError(
+		redirectErrorToOrigin(
 			w,
 			r,
-			cfg,
+			frontendOrigin,
 			"missing_email",
 			"We cannot sign you in because Atlassian did not provide your email address. Please make your Atlassian email visible or contact support.",
 		)
@@ -299,7 +309,7 @@ func handleCallback(
 
 	if err := upsertFirebaseUser(ctx, authClient, uid, me); err != nil {
 		log.Printf("firebase user upsert failed: %v", err)
-		redirectError(w, r, cfg, "firebase_user_failed", "Could not prepare your Firebase account.")
+		redirectErrorToOrigin(w, r, frontendOrigin, "firebase_user_failed", "Could not prepare your Firebase account.")
 		return
 	}
 
@@ -312,7 +322,7 @@ func handleCallback(
 	customToken, err := authClient.CustomTokenWithClaims(ctx, uid, claims)
 	if err != nil {
 		log.Printf("firebase custom token failed: %v", err)
-		redirectError(w, r, cfg, "firebase_token_failed", "Could not create Firebase login token.")
+		redirectErrorToOrigin(w, r, frontendOrigin, "firebase_token_failed", "Could not create Firebase login token.")
 		return
 	}
 
@@ -331,11 +341,11 @@ func handleCallback(
 
 	if err := storeLoginCode(ctx, fsClient, loginCode, record); err != nil {
 		log.Printf("store login code failed: %v", err)
-		redirectError(w, r, cfg, "login_code_failed", "Could not create login session.")
+		redirectErrorToOrigin(w, r, frontendOrigin, "login_code_failed", "Could not create login session.")
 		return
 	}
 
-	callbackURL := cfg.FrontendBaseURL +
+	callbackURL := frontendOrigin +
 		"/auth/callback?login_code=" + url.QueryEscape(loginCode) +
 		"&redirect=" + url.QueryEscape(redirectPath)
 
@@ -563,7 +573,7 @@ func consumeLoginCode(ctx context.Context, fsClient *firestore.Client, loginCode
 	return record, nil
 }
 
-func verifyState(state string, secret string) (OAuthStatePayload, error) {
+func verifyState(state string, secret string, allowedOrigins []string, fallback string) (OAuthStatePayload, error) {
 	payloadBytes, err := verifySignedBlob(state, secret)
 	if err != nil {
 		return OAuthStatePayload{}, err
@@ -583,6 +593,7 @@ func verifyState(state string, secret string) (OAuthStatePayload, error) {
 	}
 
 	payload.Redirect = safeRedirectPath(payload.Redirect)
+	payload.FrontendOrigin = safeFrontendOrigin(payload.FrontendOrigin, allowedOrigins, fallback)
 
 	return payload, nil
 }
@@ -630,7 +641,11 @@ func verifySignedBlob(token string, secret string) ([]byte, error) {
 }
 
 func redirectError(w http.ResponseWriter, r *http.Request, cfg Config, code string, message string) {
-	u := cfg.FrontendBaseURL +
+	redirectErrorToOrigin(w, r, cfg.FrontendBaseURL, code, message)
+}
+
+func redirectErrorToOrigin(w http.ResponseWriter, r *http.Request, frontendOrigin string, code string, message string) {
+	u := frontendOrigin +
 		"/login?error=" + url.QueryEscape(code) +
 		"&message=" + url.QueryEscape(message)
 
@@ -661,6 +676,26 @@ func safeRedirectPath(raw string) string {
 	}
 
 	return raw
+}
+
+func safeFrontendOrigin(raw string, allowed []string, fallback string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if raw == "" {
+		return fallback
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fallback
+	}
+
+	for _, origin := range allowed {
+		if raw == origin {
+			return raw
+		}
+	}
+
+	return fallback
 }
 
 func randomString(nBytes int) string {
