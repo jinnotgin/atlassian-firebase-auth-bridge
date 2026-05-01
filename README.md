@@ -1,0 +1,1 @@
+# atlassian-firebase-auth-bridge
