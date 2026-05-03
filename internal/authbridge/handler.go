@@ -655,24 +655,24 @@ func redirectErrorToOrigin(w http.ResponseWriter, r *http.Request, frontendOrigi
 func safeRedirectPath(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "/overview"
+		return "/"
 	}
 
 	if !strings.HasPrefix(raw, "/") {
-		return "/overview"
+		return "/"
 	}
 
 	if strings.HasPrefix(raw, "//") {
-		return "/overview"
+		return "/"
 	}
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "/overview"
+		return "/"
 	}
 
 	if u.IsAbs() || u.Host != "" {
-		return "/overview"
+		return "/"
 	}
 
 	return raw

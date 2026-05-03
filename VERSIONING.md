@@ -9,11 +9,11 @@
 
 ## How Versioning Works
 
-The tag format is `v*.*.*` (e.g. `v0.1`, `v1.0.0`). The CI workflow triggers on git tags matching this pattern.
+The tag format is `v*.*.*` (e.g. `v0.4`, `v1.0.0`). The CI workflow triggers on git tags matching this pattern.
 
 ### To release a new version:
 ```bash
-git tag v<VERSION>        # e.g. git tag v0.2.0
+git tag v<VERSION>        # e.g. git tag v0.4
 git push origin v<VERSION>
 ```
 
@@ -27,9 +27,6 @@ git push origin v<VERSION>
 
 - Pushing to `main` also updates the `:latest` tag.
 - Git tag pushes do **NOT** update `:latest`.
-
-## Current Version
-- Latest tag: `v0.1` (as of 1 May 2026)
 
 ## Key Files
 - `Dockerfile` — multi-stage distroless build, output binary is `/auth-bridge`
